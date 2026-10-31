@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 
 # ==========================================
 # IKKEZ77 BOT 2.0
-# EARLY COIN DISCOVERY
+# EARLY COIN HUNTER
 # ==========================================
 
 BOT_NAME = "ikkez77 Bot 2.0"
@@ -31,19 +31,30 @@ STOP_LOSS_PERCENT = -30.0
 SCAN_INTERVAL_SECONDS = 60
 MAX_POOL_AGE_MINUTES = 60
 
+# Sicherheitsprüfung
+MAX_RUGCHECK_SCORE = 20
+RUGCHECK_CACHE_SECONDS = 600
+
 GECKO_URL = (
     "https://api.geckoterminal.com/api/v2/"
     "networks/solana/new_pools"
 )
 
+RUGCHECK_URL = (
+    "https://api.rugcheck.xyz/v1/tokens/"
+)
+
 HEADERS = {
-    "Accept": "application/json;version=20230302"
+    "Accept": "application/json"
 }
 
 # Daten
 OPEN_TRADES = {}
 TRACKED_TOKENS = set()
 TRACKED_POOLS = set()
+RUGCHECK_CACHE = {}
+
+session = requests.Session()
 
 logging.basicConfig(
     level=logging.INFO,
@@ -54,8 +65,6 @@ logger = logging.getLogger(BOT_NAME)
 
 
 def parse_creation_time(value):
-    """Liest das Erstellungsdatum eines Pools."""
-
     if not value:
         return None
 
@@ -68,8 +77,6 @@ def parse_creation_time(value):
 
 
 def get_pool_age_minutes(created_at):
-    """Berechnet das Alter eines Pools."""
-
     creation_time = parse_creation_time(created_at)
 
     if creation_time is None:
@@ -77,56 +84,52 @@ def get_pool_age_minutes(created_at):
 
     now = datetime.now(timezone.utc)
 
-    age = now - creation_time
-
-    return age.total_seconds() / 60
+    return (
+        now - creation_time
+    ).total_seconds() / 60
 
 
 def get_new_pools():
-    """Lädt neue Solana-Pools von GeckoTerminal."""
-
     params = {
         "page": 1,
         "include": "base_token"
     }
 
     try:
-        response = requests.get(
+        response = session.get(
             GECKO_URL,
-            headers=HEADERS,
+            headers={
+                "Accept": "application/json;version=20230302"
+            },
             params=params,
             timeout=15
         )
-
-        if response.status_code == 429:
-            logger.warning(
-                "GeckoTerminal Rate Limit erreicht."
-            )
-            return []
 
         response.raise_for_status()
 
         result = response.json()
 
+        if not isinstance(result, dict):
+            logger.error("Ungültige GeckoTerminal-Antwort.")
+            return []
+
         return result.get("data", [])
 
     except requests.RequestException as error:
         logger.error(
-            "GeckoTerminal Verbindungsfehler: %s",
+            "GeckoTerminal Fehler: %s",
             error
         )
         return []
 
     except ValueError:
         logger.error(
-            "GeckoTerminal Antwort konnte nicht gelesen werden."
+            "GeckoTerminal JSON konnte nicht gelesen werden."
         )
         return []
 
 
 def extract_token_address(pool):
-    """Liest die Basis-Token-Adresse aus."""
-
     relationships = pool.get("relationships", {})
 
     base_token = relationships.get(
@@ -143,9 +146,157 @@ def extract_token_address(pool):
     return ""
 
 
-def discover_fresh_coins():
-    """Findet Pools, die höchstens 60 Minuten alt sind."""
+def check_rugcheck(token_address):
+    """
+    Prüft einen Token bei RugCheck.
 
+    Bei API-Fehlern oder fehlenden Daten:
+    keine Sicherheitsfreigabe.
+    """
+
+    now = time.time()
+
+    cached = RUGCHECK_CACHE.get(token_address)
+
+    if cached:
+        cache_age = now - cached["timestamp"]
+
+        if cache_age < RUGCHECK_CACHE_SECONDS:
+            return cached["result"]
+
+    url = (
+        RUGCHECK_URL
+        + token_address
+        + "/report/summary"
+    )
+
+    try:
+        response = session.get(
+            url,
+            headers=HEADERS,
+            timeout=20
+        )
+
+        if response.status_code == 404:
+            logger.warning(
+                "RugCheck kennt Token noch nicht: %s",
+                token_address
+            )
+            return {
+                "approved": False,
+                "reason": "Kein RugCheck-Bericht vorhanden"
+            }
+
+        if response.status_code == 429:
+            logger.warning(
+                "RugCheck Rate Limit erreicht."
+            )
+            return {
+                "approved": False,
+                "reason": "RugCheck Rate Limit"
+            }
+
+        response.raise_for_status()
+
+        report = response.json()
+
+        if not isinstance(report, dict):
+            return {
+                "approved": False,
+                "reason": "Ungültige RugCheck-Antwort"
+            }
+
+        normalized_score = report.get(
+            "score_normalised"
+        )
+
+        risks = report.get("risks")
+
+        if normalized_score is None or not isinstance(
+            risks, list
+        ):
+            return {
+                "approved": False,
+                "reason": "RugCheck-Daten unvollständig"
+            }
+
+        normalized_score = int(normalized_score)
+
+        dangerous_levels = {
+            "danger",
+            "critical",
+            "high"
+        }
+
+        dangerous_risks = []
+
+        for risk in risks:
+            if not isinstance(risk, dict):
+                continue
+
+            level = str(
+                risk.get("level", "")
+            ).lower()
+
+            if level in dangerous_levels:
+                dangerous_risks.append(
+                    risk.get("name", "Unbekanntes Risiko")
+                )
+
+        if dangerous_risks:
+            result = {
+                "approved": False,
+                "score": normalized_score,
+                "reason": (
+                    "Gefährliche Risiken: "
+                    + ", ".join(dangerous_risks)
+                )
+            }
+
+        elif normalized_score > MAX_RUGCHECK_SCORE:
+            result = {
+                "approved": False,
+                "score": normalized_score,
+                "reason": "RugCheck-Risikoscore zu hoch"
+            }
+
+        else:
+            result = {
+                "approved": True,
+                "score": normalized_score,
+                "reason": "RugCheck-Prüfung bestanden"
+            }
+
+        RUGCHECK_CACHE[token_address] = {
+            "timestamp": now,
+            "result": result
+        }
+
+        return result
+
+    except requests.RequestException as error:
+        logger.error(
+            "RugCheck Verbindungsfehler: %s",
+            error
+        )
+
+        return {
+            "approved": False,
+            "reason": "RugCheck nicht erreichbar"
+        }
+
+    except (ValueError, TypeError):
+        logger.error(
+            "RugCheck-Antwort konnte nicht verarbeitet werden."
+        )
+
+        return {
+            "approved": False,
+            "reason": "Ungültige RugCheck-Daten"
+        }
+
+
+def discover_fresh_coins():
     pools = get_new_pools()
 
     fresh_coins = []
@@ -161,26 +312,21 @@ def discover_fresh_coins():
 
         pool_address = attributes.get("address", "")
 
-        created_at = attributes.get(
-            "pool_created_at"
-        )
-
         if not pool_address:
             continue
 
         if pool_address in TRACKED_POOLS:
             continue
 
+        created_at = attributes.get(
+            "pool_created_at"
+        )
+
         age_minutes = get_pool_age_minutes(
             created_at
         )
 
-        # Ohne gültiges Erstellungsdatum keine Freigabe.
         if age_minutes is None:
-            logger.warning(
-                "Pool ohne gültiges Erstellungsdatum übersprungen: %s",
-                pool_address
-            )
             continue
 
         if age_minutes < 0:
@@ -192,10 +338,6 @@ def discover_fresh_coins():
         token_address = extract_token_address(pool)
 
         if not token_address:
-            logger.warning(
-                "Keine Token-Adresse gefunden: %s",
-                pool_address
-            )
             continue
 
         TRACKED_POOLS.add(pool_address)
@@ -216,42 +358,61 @@ def discover_fresh_coins():
 
         fresh_coins.append(coin)
 
-        logger.info(
-            "NEUER COIN | %s | Alter: %.1f Minuten | "
-            "Liquidität: $%.2f | Token: %s",
-            coin["pool_name"],
-            coin["age_minutes"],
-            coin["liquidity_usd"],
-            coin["token_address"]
-        )
-
-    logger.info(
-        "Neue Coins unter 60 Minuten: %s",
-        len(fresh_coins)
-    )
-
     return fresh_coins
 
 
 def scan_once():
-    """Ein Erkennungsdurchlauf."""
-
     logger.info("Starte Early-Coin-Suche ...")
 
     coins = discover_fresh_coins()
 
     logger.info(
-        "Erkennungsdurchlauf abgeschlossen. Kandidaten: %s",
+        "Neue Pools unter 60 Minuten: %s",
         len(coins)
     )
 
-    return coins
+    approved_coins = []
+
+    for coin in coins:
+
+        logger.info(
+            "Prüfe Sicherheit: %s",
+            coin["pool_name"]
+        )
+
+        security = check_rugcheck(
+            coin["token_address"]
+        )
+
+        if not security["approved"]:
+            logger.warning(
+                "ABGELEHNT | %s | %s",
+                coin["pool_name"],
+                security["reason"]
+            )
+            continue
+
+        coin["rugcheck_score"] = security["score"]
+
+        approved_coins.append(coin)
+
+        logger.info(
+            "SICHERHEIT BESTANDEN | %s | "
+            "RugCheck-Risiko: %s",
+            coin["pool_name"],
+            security["score"]
+        )
+
+    logger.info(
+        "Sicherheitsprüfung bestanden: %s von %s",
+        len(approved_coins),
+        len(coins)
+    )
+
+    return approved_coins
 
 
 def start_bot():
-
-    logger.info("=" * 45)
-    logger.info("%s gestartet", BOT_NAME)
 
     mode = (
         TRADING_MODE
@@ -259,18 +420,16 @@ def start_bot():
         else "paper"
     )
 
+    logger.info("=" * 45)
+    logger.info("%s gestartet", BOT_NAME)
     logger.info("Modus: %s", mode.upper())
     logger.info("Einsatz pro Kauf: $%.2f", TRADE_SIZE_USD)
     logger.info("Max. Positionen: %s", MAX_OPEN_POSITIONS)
     logger.info("Take Profit: +%.0f%%", TAKE_PROFIT_PERCENT)
     logger.info("Stop Loss: %.0f%%", STOP_LOSS_PERCENT)
-
-    logger.info(
-        "Maximales Pool-Alter: %s Minuten",
-        MAX_POOL_AGE_MINUTES
-    )
-
-    logger.info("Käufe sind noch nicht aktiviert.")
+    logger.info("Max. Pool-Alter: %s Minuten", MAX_POOL_AGE_MINUTES)
+    logger.info("Max. RugCheck-Risikoscore: %s", MAX_RUGCHECK_SCORE)
+    logger.info("Automatische Käufe sind noch deaktiviert.")
     logger.info("=" * 45)
 
     while True:
